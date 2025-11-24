@@ -5,8 +5,6 @@
 from __future__ import annotations
 
 from typing import cast
-import cv2
-import numpy as np
 import torch
 from ultralytics.nn.modules.head import Segment
 from ultralytics.nn.tasks import SegmentationModel
@@ -20,6 +18,178 @@ from qai_hub_models.models._shared.yolo.utils import (
 )
 from qai_hub_models.models.common import Precision
 from qai_hub_models.utils.base_model import BaseModel, InputSpec
+
+
+class PseudoNumpy:
+    """Pseudo implementation of numpy functionality using pure PyTorch."""
+    
+    @staticmethod
+    class uint8:
+        """Pseudo uint8 dtype."""
+        pass
+    
+    @staticmethod
+    def astype(arr, dtype):
+        """Convert array to specified dtype using PyTorch."""
+        if isinstance(arr, torch.Tensor):
+            if dtype == PseudoNumpy.uint8 or str(dtype) == 'uint8':
+                return arr.byte()
+            elif str(dtype) == 'int':
+                return arr.int()
+        return arr
+    
+    @staticmethod
+    def array_to_uint8(arr):
+        """Convert array to uint8 using PyTorch."""
+        if isinstance(arr, torch.Tensor):
+            return arr.byte()
+        # If it's already a tensor-like object, convert to torch tensor
+        return torch.tensor(arr, dtype=torch.uint8)
+    
+    @staticmethod
+    def array_to_int(arr):
+        """Convert array to int using PyTorch."""
+        if isinstance(arr, torch.Tensor):
+            return arr.int()
+        return torch.tensor(arr, dtype=torch.int32)
+
+
+class PseudoCV2:
+    """Pseudo implementation of OpenCV functionality used in this module."""
+    
+    COLOR_RGB2HSV = 'RGB2HSV'
+    
+    @staticmethod
+    def resize(image, size, interpolation=None):
+        """
+        Resize image to specified size using PyTorch operations.
+        
+        Args:
+            image: torch tensor of shape (H, W) or (H, W, C)
+            size: tuple (width, height)
+            interpolation: interpolation method (ignored, uses bilinear)
+        
+        Returns:
+            Resized image as torch tensor
+        """
+        import torch.nn.functional as F
+        
+        # Convert to torch tensor if needed
+        if not isinstance(image, torch.Tensor):
+            img_tensor = torch.tensor(image)
+        else:
+            img_tensor = image
+        
+        # Store original dtype
+        original_dtype = img_tensor.dtype
+        
+        # Handle 2D images (H, W)
+        if img_tensor.ndim == 2:
+            img_tensor = img_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+            was_2d = True
+        # Handle 3D images (H, W, C)
+        elif img_tensor.ndim == 3:
+            img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W)
+            was_2d = False
+        else:
+            was_2d = False
+        
+        # Resize using bilinear interpolation
+        width, height = size
+        resized = F.interpolate(
+            img_tensor.float(),
+            size=(height, width),
+            mode='bilinear',
+            align_corners=False
+        )
+        
+        # Convert back to original format
+        if was_2d:
+            resized = resized.squeeze(0).squeeze(0)
+        else:
+            resized = resized.squeeze(0).permute(1, 2, 0)
+        
+        # Convert back to original dtype
+        resized = resized.to(original_dtype)
+        
+        return resized
+    
+    @staticmethod
+    def cvtColor(image, conversion_code):
+        """
+        Convert image color space using pure PyTorch.
+        
+        Args:
+            image: torch tensor of shape (H, W, C)
+            conversion_code: color conversion code (e.g., COLOR_RGB2HSV)
+        
+        Returns:
+            Converted image as torch tensor
+        """
+        if conversion_code == PseudoCV2.COLOR_RGB2HSV or conversion_code == 'RGB2HSV':
+            return PseudoCV2._rgb_to_hsv(image)
+        else:
+            raise NotImplementedError(f"Conversion code {conversion_code} not implemented")
+    
+    @staticmethod
+    def _rgb_to_hsv(rgb_image):
+        """
+        Convert RGB image to HSV color space using pure PyTorch.
+        
+        Args:
+            rgb_image: torch tensor of shape (H, W, 3) with values in range [0, 255]
+        
+        Returns:
+            HSV image as torch tensor with H in [0, 179], S in [0, 255], V in [0, 255]
+        """
+        # Convert to torch tensor if needed
+        if not isinstance(rgb_image, torch.Tensor):
+            rgb_image = torch.tensor(rgb_image)
+        
+        # Normalize RGB to [0, 1]
+        rgb_normalized = rgb_image.float() / 255.0
+        
+        r = rgb_normalized[:, :, 0]
+        g = rgb_normalized[:, :, 1]
+        b = rgb_normalized[:, :, 2]
+        
+        max_c = torch.maximum(torch.maximum(r, g), b)
+        min_c = torch.minimum(torch.minimum(r, g), b)
+        diff = max_c - min_c
+        
+        # Initialize HSV
+        h = torch.zeros_like(max_c)
+        s = torch.zeros_like(max_c)
+        v = max_c
+        
+        # Calculate Saturation
+        mask = max_c != 0
+        s[mask] = diff[mask] / max_c[mask]
+        
+        # Calculate Hue
+        mask_diff = diff != 0
+        
+        # Red is max
+        mask_r = (max_c == r) & mask_diff
+        h[mask_r] = 60 * (((g[mask_r] - b[mask_r]) / diff[mask_r]) % 6)
+        
+        # Green is max
+        mask_g = (max_c == g) & mask_diff
+        h[mask_g] = 60 * (((b[mask_g] - r[mask_g]) / diff[mask_g]) + 2)
+        
+        # Blue is max
+        mask_b = (max_c == b) & mask_diff
+        h[mask_b] = 60 * (((r[mask_b] - g[mask_b]) / diff[mask_b]) + 4)
+        
+        # Normalize to OpenCV ranges: H [0, 179], S [0, 255], V [0, 255]
+        h = (h / 2).byte()  # OpenCV uses H in [0, 179]
+        s = (s * 255).byte()
+        v = (v * 255).byte()
+        
+        # Stack into HSV image
+        hsv_image = torch.stack([h, s, v], dim=2)
+        
+        return hsv_image
 
 DEFAULT_ULTRALYTICS_IMAGE_INPUT_HW = 640
 
@@ -106,6 +276,7 @@ class UltralyticsMulticlassSegmentor(BaseModel):
     def _analyze_color_distribution(self, image: torch.Tensor, boxes: torch.Tensor, mask_coeffs: torch.Tensor, mask_protos: torch.Tensor) -> torch.Tensor:
         """
         Analyze color distribution in segmented regions to classify as Bauxite or Laterite.
+        Uses pure PyTorch operations without numpy or cv2.
         
         Returns:
             color_classes: Tensor of shape [batch_size, num_anchors] with values 0 (Bauxite) or 1 (Laterite)
@@ -113,14 +284,14 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         batch_size = image.shape[0]
         num_anchors = boxes.shape[1]
         
-        # Convert image from [B, C, H, W] to numpy for color analysis
+        # Convert image from [B, C, H, W] to [B, H, W, C] for color analysis
         # Image is in RGB format with range [0, 1]
-        image_np = (image.cpu().numpy() * 255).astype(np.uint8)
+        image_uint8 = (image.cpu() * 255).byte().permute(0, 2, 3, 1)  # [B, H, W, C]
         
         color_classes = torch.zeros((batch_size, num_anchors), dtype=torch.long, device=image.device)
         
         for b in range(batch_size):
-            img = image_np[b].transpose(1, 2, 0)  # [H, W, C]
+            img = image_uint8[b]  # [H, W, C]
             
             # Generate masks from coefficients and prototypes
             masks = torch.matmul(mask_coeffs[b], mask_protos[b].reshape(mask_protos.shape[1], -1))
@@ -129,14 +300,15 @@ class UltralyticsMulticlassSegmentor(BaseModel):
             
             for i in range(num_anchors):
                 # Get the mask for this anchor
-                mask = masks[i].cpu().numpy()
+                mask = masks[i].cpu()
                 
                 # Resize mask to match image size
-                mask_resized = cv2.resize(mask, (img.shape[1], img.shape[0]))
-                mask_binary = (mask_resized > 0.5).astype(np.uint8)
+                mask_resized = PseudoCV2.resize(mask, (img.shape[1], img.shape[0]))
+                mask_binary = (mask_resized > 0.5).byte()
                 
                 # Get bounding box
-                x1, y1, x2, y2 = boxes[b, i].cpu().numpy().astype(int)
+                box_coords = boxes[b, i].cpu().int()
+                x1, y1, x2, y2 = box_coords[0].item(), box_coords[1].item(), box_coords[2].item(), box_coords[3].item()
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
                 
@@ -151,14 +323,18 @@ class UltralyticsMulticlassSegmentor(BaseModel):
                     continue
                 
                 # Get pixels within the mask
-                masked_pixels = roi[roi_mask > 0]
+                mask_indices = roi_mask > 0
+                if mask_indices.sum() == 0:
+                    continue
+                
+                masked_pixels = roi[mask_indices]
                 
                 if len(masked_pixels) == 0:
                     continue
                 
                 # Convert RGB to HSV for better color analysis
-                roi_hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
-                masked_pixels_hsv = roi_hsv[roi_mask > 0]
+                roi_hsv = PseudoCV2.cvtColor(roi, PseudoCV2.COLOR_RGB2HSV)
+                masked_pixels_hsv = roi_hsv[mask_indices]
                 
                 # Color thresholds in HSV
                 # WHITE: High V (value), Low S (saturation)
@@ -170,22 +346,22 @@ class UltralyticsMulticlassSegmentor(BaseModel):
                 
                 # Count WHITE pixels (low saturation, high value)
                 white_mask = (masked_pixels_hsv[:, 1] < 50) & (masked_pixels_hsv[:, 2] > 180)
-                white_count = white_mask.sum()
+                white_count = white_mask.sum().item()
                 
                 # Count PALE YELLOW pixels (yellow hue, low saturation, high value)
                 pale_yellow_mask = (masked_pixels_hsv[:, 0] >= 20) & (masked_pixels_hsv[:, 0] <= 40) & \
                                    (masked_pixels_hsv[:, 1] < 100) & (masked_pixels_hsv[:, 2] > 150)
-                pale_yellow_count = pale_yellow_mask.sum()
+                pale_yellow_count = pale_yellow_mask.sum().item()
                 
                 # Count BRIGHT YELLOW pixels (yellow hue, high saturation)
                 bright_yellow_mask = (masked_pixels_hsv[:, 0] >= 20) & (masked_pixels_hsv[:, 0] <= 40) & \
                                      (masked_pixels_hsv[:, 1] >= 100)
-                bright_yellow_count = bright_yellow_mask.sum()
+                bright_yellow_count = bright_yellow_mask.sum().item()
                 
                 # Count RED pixels (red hue, high saturation)
                 red_mask = ((masked_pixels_hsv[:, 0] <= 10) | (masked_pixels_hsv[:, 0] >= 160)) & \
                            (masked_pixels_hsv[:, 1] >= 100)
-                red_count = red_mask.sum()
+                red_count = red_mask.sum().item()
                 
                 # Calculate percentages
                 white_pale_yellow_ratio = (white_count + pale_yellow_count) / total_pixels
