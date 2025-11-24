@@ -5,7 +5,8 @@
 from __future__ import annotations
 
 from typing import cast
-
+import cv2
+import numpy as np
 import torch
 from ultralytics.nn.modules.head import Segment
 from ultralytics.nn.tasks import SegmentationModel
@@ -21,7 +22,6 @@ from qai_hub_models.models.common import Precision
 from qai_hub_models.utils.base_model import BaseModel, InputSpec
 
 DEFAULT_ULTRALYTICS_IMAGE_INPUT_HW = 640
-
 
 class UltralyticsSingleClassSegmentor(BaseModel):
     """Ultralytics segmentor that segments 1 class."""
@@ -103,6 +103,127 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         self.precision = precision
         patch_ultralytics_segmentation_head(model)
 
+    def _analyze_color_distribution(self, image: torch.Tensor, boxes: torch.Tensor, mask_coeffs: torch.Tensor, mask_protos: torch.Tensor) -> torch.Tensor:
+        """
+        Analyze color distribution in segmented regions to classify as Bauxite or Laterite.
+        
+        Returns:
+            color_classes: Tensor of shape [batch_size, num_anchors] with values 0 (Bauxite) or 1 (Laterite)
+        """
+        batch_size = image.shape[0]
+        num_anchors = boxes.shape[1]
+        
+        # Convert image from [B, C, H, W] to numpy for color analysis
+        # Image is in RGB format with range [0, 1]
+        image_np = (image.cpu().numpy() * 255).astype(np.uint8)
+        
+        color_classes = torch.zeros((batch_size, num_anchors), dtype=torch.long, device=image.device)
+        
+        for b in range(batch_size):
+            img = image_np[b].transpose(1, 2, 0)  # [H, W, C]
+            
+            # Generate masks from coefficients and prototypes
+            masks = torch.matmul(mask_coeffs[b], mask_protos[b].reshape(mask_protos.shape[1], -1))
+            masks = masks.reshape(num_anchors, mask_protos.shape[2], mask_protos.shape[3])
+            masks = torch.sigmoid(masks)
+            
+            for i in range(num_anchors):
+                # Get the mask for this anchor
+                mask = masks[i].cpu().numpy()
+                
+                # Resize mask to match image size
+                mask_resized = cv2.resize(mask, (img.shape[1], img.shape[0]))
+                mask_binary = (mask_resized > 0.5).astype(np.uint8)
+                
+                # Get bounding box
+                x1, y1, x2, y2 = boxes[b, i].cpu().numpy().astype(int)
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+                
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Extract region of interest
+                roi = img[y1:y2, x1:x2]
+                roi_mask = mask_binary[y1:y2, x1:x2]
+                
+                if roi_mask.sum() == 0:
+                    continue
+                
+                # Get pixels within the mask
+                masked_pixels = roi[roi_mask > 0]
+                
+                if len(masked_pixels) == 0:
+                    continue
+                
+                # Convert RGB to HSV for better color analysis
+                roi_hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+                masked_pixels_hsv = roi_hsv[roi_mask > 0]
+                
+                # Color thresholds in HSV
+                # WHITE: High V (value), Low S (saturation)
+                # PALE YELLOW: H in [20-40], Low S, High V
+                # BRIGHT YELLOW: H in [20-40], High S, High V
+                # RED: H in [0-10] or [160-180], High S
+                
+                total_pixels = len(masked_pixels_hsv)
+                
+                # Count WHITE pixels (low saturation, high value)
+                white_mask = (masked_pixels_hsv[:, 1] < 50) & (masked_pixels_hsv[:, 2] > 180)
+                white_count = white_mask.sum()
+                
+                # Count PALE YELLOW pixels (yellow hue, low saturation, high value)
+                pale_yellow_mask = (masked_pixels_hsv[:, 0] >= 20) & (masked_pixels_hsv[:, 0] <= 40) & \
+                                   (masked_pixels_hsv[:, 1] < 100) & (masked_pixels_hsv[:, 2] > 150)
+                pale_yellow_count = pale_yellow_mask.sum()
+                
+                # Count BRIGHT YELLOW pixels (yellow hue, high saturation)
+                bright_yellow_mask = (masked_pixels_hsv[:, 0] >= 20) & (masked_pixels_hsv[:, 0] <= 40) & \
+                                     (masked_pixels_hsv[:, 1] >= 100)
+                bright_yellow_count = bright_yellow_mask.sum()
+                
+                # Count RED pixels (red hue, high saturation)
+                red_mask = ((masked_pixels_hsv[:, 0] <= 10) | (masked_pixels_hsv[:, 0] >= 160)) & \
+                           (masked_pixels_hsv[:, 1] >= 100)
+                red_count = red_mask.sum()
+                
+                # Calculate percentages
+                white_pale_yellow_ratio = (white_count + pale_yellow_count) / total_pixels
+                white_ratio = white_count / total_pixels
+                red_ratio = red_count / total_pixels
+                red_bright_yellow_ratio = (red_count + bright_yellow_count) / total_pixels
+                other_ratio = 1.0 - white_ratio - pale_yellow_count / total_pixels - red_ratio - bright_yellow_count / total_pixels
+                
+                # Classification logic
+                is_bauxite = False
+                is_laterite = False
+                
+                # Rule 1: Majority WHITE or PALE YELLOW colour -> Bauxite
+                if white_pale_yellow_ratio > 0.5:
+                    is_bauxite = True
+                
+                # Rule 2: WHITE colour more than RED colour -> Bauxite
+                elif white_count > red_count:
+                    is_bauxite = True
+                
+                # Rule 3: RED Colour dominant -> Laterite
+                elif red_ratio > 0.3:
+                    is_laterite = True
+                
+                # Rule 4: ONLY RED and BRIGHT YELLOW colour -> Laterite
+                elif red_bright_yellow_ratio > 0.6 and other_ratio < 0.2:
+                    is_laterite = True
+                
+                # Assign class: 0 for Bauxite, 1 for Laterite
+                if is_laterite:
+                    color_classes[b, i] = 1
+                elif is_bauxite:
+                    color_classes[b, i] = 0
+                else:
+                    color_classes[b, i] = 0  # Default to Bauxite
+        
+        return color_classes
+
     @staticmethod
     def get_input_spec(
         batch_size: int = 1,
@@ -126,6 +247,8 @@ class UltralyticsMulticlassSegmentor(BaseModel):
     @staticmethod
     def get_channel_last_outputs() -> list[str]:
         return ["mask_protos"]
+
+
 
     def forward(self, image: torch.Tensor):
         """
@@ -168,9 +291,28 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         scores = scores.permute(0, 2, 1)
         scores, classes = get_most_likely_score(scores)
 
+        # Apply color-based classification logic
+        # Analyze color distribution to determine if regions meet Bauxite (0) or Laterite (1) criteria
+        color_classes = self._analyze_color_distribution(image, boxes, mask_coeffs.permute(0, 2, 1), mask_protos)
+        
+        # Boost confidence by 1.5x when color analysis confirms the classification
+        # If color_classes matches classes, it means the color criteria are met
+        # color_classes: 0 = Bauxite criteria met, 1 = Laterite criteria met
+        # classes: predicted class from model
+        confidence_boost = torch.where(
+            color_classes == classes,
+            torch.tensor(1.5, device=scores.device, dtype=scores.dtype),
+            torch.tensor(1.0, device=scores.device, dtype=scores.dtype)
+        )
+        scores = scores * confidence_boost
+        
+        # Clamp scores to [0, 1] range
+        scores = torch.clamp(scores, 0.0, 1.0)
+
         if self.precision == Precision.float:
             classes = classes.to(torch.float32)
         if self.precision is None:
             classes = classes.to(torch.uint8)
 
         return boxes, scores, mask_coeffs.permute(0, 2, 1), classes, mask_protos
+
