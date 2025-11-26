@@ -339,33 +339,35 @@ class UltralyticsMulticlassSegmentor(BaseModel):
             red_bright_yellow_ratio = (red_count + bright_yellow_count) / total_pixels
             other_ratio = 1.0 - white_ratio - pale_yellow_count / total_pixels - red_ratio - bright_yellow_count / total_pixels
             
-            # Classification logic
-            is_bauxite = False
-            is_laterite = False
+            # Classification logic with priority order
+            # Rules 1 and 3 are the biggest indicators (checked first)
+            # Rules 2 and 4 are fallback checks
+            # Default to Bauxite (0) if nothing matches
             
-            # Rule 1: Majority WHITE or PALE YELLOW colour -> Bauxite
+            predicted_class = 0  # Default to Bauxite
+            
+            # Priority 1: Rule 1 - Majority WHITE or PALE YELLOW colour -> Bauxite
             if white_pale_yellow_ratio > 0.5:
-                is_bauxite = True
+                predicted_class = 0  # Bauxite
             
-            # Rule 2: WHITE colour more than RED colour -> Bauxite
-            elif white_count > red_count:
-                is_bauxite = True
-            
-            # Rule 3: RED Colour dominant -> Laterite
+            # Priority 2: Rule 3 - RED Colour dominant -> Laterite
             elif red_ratio > 0.3:
-                is_laterite = True
+                predicted_class = 1  # Laterite
             
-            # Rule 4: ONLY RED and BRIGHT YELLOW colour -> Laterite
+            # Fallback: Rule 2 - WHITE colour more than RED colour -> Bauxite
+            elif white_count > red_count:
+                predicted_class = 0  # Bauxite
+            
+            # Fallback: Rule 4 - ONLY RED and BRIGHT YELLOW colour -> Laterite
             elif red_bright_yellow_ratio > 0.6 and other_ratio < 0.2:
-                is_laterite = True
+                predicted_class = 1  # Laterite
             
-            # Assign class ONLY to the most confident anchor: 0 for Bauxite, 1 for Laterite
-            if is_laterite:
-                color_classes[b, max_conf_idx] = 1
-            elif is_bauxite:
-                color_classes[b, max_conf_idx] = 0
+            # If nothing matches, default to Bauxite (0)
             else:
-                color_classes[b, max_conf_idx] = 0  # Default to Bauxite
+                predicted_class = 0  # Default to Bauxite
+            
+            # Assign class ONLY to the most confident anchor
+            color_classes[b, max_conf_idx] = predicted_class
         
         return color_classes
 
@@ -437,22 +439,13 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         scores, classes = get_most_likely_score(scores)
 
         # Apply color-based classification logic ONLY to the most confident bounding box
-        # Analyze color distribution to determine if regions meet Bauxite (0) or Laterite (1) criteria
-        color_classes = self._analyze_color_distribution(image, boxes, mask_coeffs.permute(0, 2, 1), mask_protos, scores)
+        # Use the 4-rule system to determine final class: Bauxite (0) or Laterite (1)
+        # Rules 1 and 3 are primary indicators, Rules 2 and 4 are fallback checks
+        # color_classes = self._analyze_color_distribution(image, boxes, mask_coeffs.permute(0, 2, 1), mask_protos, scores)
         
-        # Boost confidence by 1.5x when color analysis confirms the classification
-        # If color_classes matches classes, it means the color criteria are met
-        # color_classes: 0 = Bauxite criteria met, 1 = Laterite criteria met
-        # classes: predicted class from model
-        confidence_boost = torch.where(
-            color_classes == classes,
-            torch.tensor(1.5, device=scores.device, dtype=scores.dtype),
-            torch.tensor(1.0, device=scores.device, dtype=scores.dtype)
-        )
-        scores = scores * confidence_boost
-        
-        # Clamp scores to [0, 1] range
-        scores = torch.clamp(scores, 0.0, 1.0)
+        # Override model predictions with color-based classification
+        # The 4 rules determine the final class, not the model's confidence
+        # classes = color_classes
 
         if self.precision == Precision.float:
             classes = classes.to(torch.float32)
