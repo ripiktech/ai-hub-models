@@ -20,6 +20,109 @@ from qai_hub_models.models.common import Precision
 from qai_hub_models.utils.base_model import BaseModel, InputSpec
 
 
+def batched_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.5) -> torch.Tensor:
+    """
+    Vectorized NMS that works with ONNX export.
+    Uses torchvision.ops.nms if available, otherwise falls back to basic filtering.
+    
+    Args:
+        boxes: Tensor of shape [N, 4] with box coordinates in format [x1, y1, x2, y2]
+        scores: Tensor of shape [N] with confidence scores for each box
+        iou_threshold: IoU threshold for suppression (default: 0.5)
+    
+    Returns:
+        keep_indices: Tensor of indices to keep after NMS
+    """
+    try:
+        # Use torchvision NMS which is ONNX-compatible
+        from torchvision.ops import nms
+        return nms(boxes, scores, iou_threshold)
+    except ImportError:
+        # Fallback: just return top-k by score (no actual NMS)
+        # This ensures ONNX export works even without torchvision
+        _, indices = torch.sort(scores, descending=True)
+        return indices
+
+
+def apply_nms_batched(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    mask_coeffs: torch.Tensor,
+    classes: torch.Tensor = None,
+    iou_threshold: float = 0.5,
+    score_threshold: float = 0.001
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Apply NMS to batched detection results using torchvision.ops.nms (ONNX-compatible).
+    
+    Args:
+        boxes: Tensor of shape [batch_size, num_anchors, 4]
+        scores: Tensor of shape [batch_size, num_anchors]
+        mask_coeffs: Tensor of shape [batch_size, num_protos, num_anchors]
+        classes: Optional tensor of shape [batch_size, num_anchors] with class indices
+        iou_threshold: IoU threshold for NMS
+        score_threshold: Minimum score threshold to keep boxes
+    
+    Returns:
+        Tuple of (filtered_boxes, filtered_scores, filtered_mask_coeffs, filtered_classes)
+        where filtered_mask_coeffs has shape [batch_size, num_protos, num_detections]
+    """
+    batch_size = boxes.shape[0]
+    num_protos = mask_coeffs.shape[1]
+    num_anchors = boxes.shape[1]
+    
+    # Process each batch
+    all_keep_indices = []
+    max_keep = 0
+    
+    for b in range(batch_size):
+        # Get boxes and scores for this batch
+        batch_boxes = boxes[b]  # [num_anchors, 4]
+        batch_scores = scores[b]  # [num_anchors]
+        
+        # Filter by score threshold
+        score_mask = batch_scores > score_threshold
+        valid_indices = torch.where(score_mask)[0]
+        
+        if valid_indices.numel() > 0:
+            valid_boxes = batch_boxes[valid_indices]
+            valid_scores = batch_scores[valid_indices]
+            
+            # Apply NMS using torchvision (ONNX-compatible)
+            keep_indices_local = batched_nms(valid_boxes, valid_scores, iou_threshold)
+            keep_indices = valid_indices[keep_indices_local]
+        else:
+            keep_indices = torch.empty((0,), dtype=torch.long, device=boxes.device)
+        
+        all_keep_indices.append(keep_indices)
+        max_keep = max(max_keep, keep_indices.numel())
+    
+    # Ensure at least 1 detection for consistent output shape
+    if max_keep == 0:
+        max_keep = 1
+    
+    # Create output tensors
+    out_boxes = torch.zeros((batch_size, max_keep, 4), device=boxes.device, dtype=boxes.dtype)
+    out_scores = torch.zeros((batch_size, max_keep), device=scores.device, dtype=scores.dtype)
+    out_mask_coeffs = torch.zeros((batch_size, num_protos, max_keep), device=mask_coeffs.device, dtype=mask_coeffs.dtype)
+    out_classes = None
+    if classes is not None:
+        out_classes = torch.zeros((batch_size, max_keep), device=classes.device, dtype=classes.dtype)
+    
+    # Fill output tensors
+    for b in range(batch_size):
+        keep_idx = all_keep_indices[b]
+        n = keep_idx.numel()
+        if n > 0:
+            out_boxes[b, :n] = boxes[b, keep_idx]
+            out_scores[b, :n] = scores[b, keep_idx]
+            out_mask_coeffs[b, :, :n] = mask_coeffs[b, :, keep_idx]
+            if classes is not None:
+                out_classes[b, :n] = classes[b, keep_idx]
+    
+    return out_boxes, out_scores, out_mask_coeffs, out_classes
+
+
 class PseudoCV2:
     """Pseudo implementation of OpenCV functionality used in this module."""
     
@@ -242,134 +345,26 @@ class UltralyticsMulticlassSegmentor(BaseModel):
 
     def _analyze_color_distribution(self, image: torch.Tensor, boxes: torch.Tensor, mask_coeffs: torch.Tensor, mask_protos: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         """
-        Analyze color distribution ONLY for the most confident bounding box per batch.
-        This dramatically improves performance while keeping the classification logic.
+        Simple threshold-based classification:
+        - Score > 50% -> Bauxite (class 0)
+        - Score <= 50% -> Laterite (class 1)
         
         Args:
             scores: Tensor of shape [batch_size, num_anchors] with confidence scores
         
         Returns:
-            color_classes: Tensor of shape [batch_size, num_anchors] with values 0 (Bauxite) or 1 (Laterite)
+            labels: Tensor of shape [batch_size, num_anchors] with values 0 (Bauxite) or 1 (Laterite)
         """
-        batch_size = image.shape[0]
-        num_anchors = boxes.shape[1]
+        batch_size = scores.shape[0]
+        num_anchors = scores.shape[1]
         
-        # Convert image from [B, C, H, W] to [B, H, W, C] for color analysis
-        # Image is in RGB format with range [0, 1]
-        image_uint8 = (image.cpu() * 255).byte().permute(0, 2, 3, 1)  # [B, H, W, C]
+        # Initialize all as Laterite (1) using int32 instead of int64 for web compatibility
+        labels = torch.ones((batch_size, num_anchors), dtype=torch.int32, device=image.device)
         
-        color_classes = torch.zeros((batch_size, num_anchors), dtype=torch.long, device=image.device)
+        # Set all predictions with score > 0.5 to Bauxite (0)
+        labels[scores > 0.5] = 0
         
-        for b in range(batch_size):
-            # Find the most confident anchor for this batch
-            max_conf_idx = torch.argmax(scores[b]).item()
-            
-            img = image_uint8[b]  # [H, W, C]
-            
-            # Generate mask ONLY for the most confident anchor
-            mask = torch.matmul(mask_coeffs[b, max_conf_idx:max_conf_idx+1], mask_protos[b].reshape(mask_protos.shape[1], -1))
-            mask = mask.reshape(mask_protos.shape[2], mask_protos.shape[3])
-            mask = torch.sigmoid(mask).cpu()
-            
-            # Resize mask to match image size
-            mask_resized = PseudoCV2.resize(mask, (img.shape[1], img.shape[0]))
-            mask_binary = (mask_resized > 0.5).byte()
-            
-            # Get bounding box
-            box_coords = boxes[b, max_conf_idx].cpu().int()
-            x1, y1, x2, y2 = box_coords[0].item(), box_coords[1].item(), box_coords[2].item(), box_coords[3].item()
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
-            
-            if x2 <= x1 or y2 <= y1:
-                continue
-            
-            # Extract region of interest
-            roi = img[y1:y2, x1:x2]
-            roi_mask = mask_binary[y1:y2, x1:x2]
-            
-            if roi_mask.sum() == 0:
-                continue
-            
-            # Get pixels within the mask
-            mask_indices = roi_mask > 0
-            if mask_indices.sum() == 0:
-                continue
-            
-            masked_pixels = roi[mask_indices]
-            
-            if len(masked_pixels) == 0:
-                continue
-            
-            # Convert RGB to HSV for better color analysis
-            roi_hsv = PseudoCV2.cvtColor(roi, PseudoCV2.COLOR_RGB2HSV)
-            masked_pixels_hsv = roi_hsv[mask_indices]
-            
-            # Color thresholds in HSV
-            # WHITE: High V (value), Low S (saturation)
-            # PALE YELLOW: H in [20-40], Low S, High V
-            # BRIGHT YELLOW: H in [20-40], High S, High V
-            # RED: H in [0-10] or [160-180], High S
-            
-            total_pixels = len(masked_pixels_hsv)
-            
-            # Count WHITE pixels (low saturation, high value)
-            white_mask = (masked_pixels_hsv[:, 1] < 50) & (masked_pixels_hsv[:, 2] > 180)
-            white_count = white_mask.sum().item()
-            
-            # Count PALE YELLOW pixels (yellow hue, low saturation, high value)
-            pale_yellow_mask = (masked_pixels_hsv[:, 0] >= 20) & (masked_pixels_hsv[:, 0] <= 40) & \
-                               (masked_pixels_hsv[:, 1] < 100) & (masked_pixels_hsv[:, 2] > 150)
-            pale_yellow_count = pale_yellow_mask.sum().item()
-            
-            # Count BRIGHT YELLOW pixels (yellow hue, high saturation)
-            bright_yellow_mask = (masked_pixels_hsv[:, 0] >= 20) & (masked_pixels_hsv[:, 0] <= 40) & \
-                                 (masked_pixels_hsv[:, 1] >= 100)
-            bright_yellow_count = bright_yellow_mask.sum().item()
-            
-            # Count RED pixels (red hue, high saturation)
-            red_mask = ((masked_pixels_hsv[:, 0] <= 10) | (masked_pixels_hsv[:, 0] >= 160)) & \
-                       (masked_pixels_hsv[:, 1] >= 100)
-            red_count = red_mask.sum().item()
-            
-            # Calculate percentages
-            white_pale_yellow_ratio = (white_count + pale_yellow_count) / total_pixels
-            white_ratio = white_count / total_pixels
-            red_ratio = red_count / total_pixels
-            red_bright_yellow_ratio = (red_count + bright_yellow_count) / total_pixels
-            other_ratio = 1.0 - white_ratio - pale_yellow_count / total_pixels - red_ratio - bright_yellow_count / total_pixels
-            
-            # Classification logic with priority order
-            # Rules 1 and 3 are the biggest indicators (checked first)
-            # Rules 2 and 4 are fallback checks
-            # Default to Bauxite (0) if nothing matches
-            
-            predicted_class = 0  # Default to Bauxite
-            
-            # Priority 1: Rule 1 - Majority WHITE or PALE YELLOW colour -> Bauxite
-            if white_pale_yellow_ratio > 0.5:
-                predicted_class = 0  # Bauxite
-            
-            # Priority 2: Rule 3 - RED Colour dominant -> Laterite
-            elif red_ratio > 0.3:
-                predicted_class = 1  # Laterite
-            
-            # Fallback: Rule 2 - WHITE colour more than RED colour -> Bauxite
-            elif white_count > red_count:
-                predicted_class = 0  # Bauxite
-            
-            # Fallback: Rule 4 - ONLY RED and BRIGHT YELLOW colour -> Laterite
-            elif red_bright_yellow_ratio > 0.6 and other_ratio < 0.2:
-                predicted_class = 1  # Laterite
-            
-            # If nothing matches, default to Bauxite (0)
-            else:
-                predicted_class = 0  # Default to Bauxite
-            
-            # Assign class ONLY to the most confident anchor
-            color_classes[b, max_conf_idx] = predicted_class
-        
-        return color_classes
+        return labels
 
     @staticmethod
     def get_input_spec(
@@ -385,7 +380,7 @@ class UltralyticsMulticlassSegmentor(BaseModel):
 
     @staticmethod
     def get_output_names() -> list[str]:
-        return ["boxes", "scores", "mask_coeffs", "class_idx", "mask_protos"]
+        return ["boxes", "scores", "mask_coeffs", "class_idx", "mask_protos", "labels"]
 
     @staticmethod
     def get_channel_last_inputs() -> list[str]:
@@ -407,7 +402,7 @@ class UltralyticsMulticlassSegmentor(BaseModel):
                    Range: float[0, 1]
                    3-channel Color Space: RGB
         Returns:
-            Tuple of 5 tensors:
+            Tuple of 6 tensors:
                 boxes:
                     Shape [1, num_anchors, 4]
                     where 4 = [x1, y1, x2, y2] (box coordinates in pixel space)
@@ -424,6 +419,9 @@ class UltralyticsMulticlassSegmentor(BaseModel):
                 mask_protos:
                     Shape [batch_size, num_prototype_masks, mask_x_size, mask_y_size]
                     Mask protos.
+                labels:
+                    Shape [batch_size, num_anchors]
+                    Label indices for each anchor (currently filled with 0 as placeholder for "Test")
         """
         boxes: torch.Tensor
         scores: torch.Tensor
@@ -438,19 +436,15 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         scores = scores.permute(0, 2, 1)
         scores, classes = get_most_likely_score(scores)
 
-        # Apply color-based classification logic ONLY to the most confident bounding box
-        # Use the 4-rule system to determine final class: Bauxite (0) or Laterite (1)
-        # Rules 1 and 3 are primary indicators, Rules 2 and 4 are fallback checks
-        # color_classes = self._analyze_color_distribution(image, boxes, mask_coeffs.permute(0, 2, 1), mask_protos, scores)
-        
-        # Override model predictions with color-based classification
-        # The 4 rules determine the final class, not the model's confidence
-        # classes = color_classes
-
+        # Keep classes unchanged from model predictions
         if self.precision == Precision.float:
             classes = classes.to(torch.float32)
         if self.precision is None:
             classes = classes.to(torch.uint8)
 
-        return boxes, scores, mask_coeffs.permute(0, 2, 1), classes, mask_protos
+        # Apply threshold-based classification for labels output only
+        # Score > 50% -> Bauxite (0), Score <= 50% -> Laterite (1)
+        labels = self._analyze_color_distribution(image, boxes, mask_coeffs.permute(0, 2, 1), mask_protos, scores)
+
+        return boxes, scores, mask_coeffs.permute(0, 2, 1), classes, mask_protos, labels
 
