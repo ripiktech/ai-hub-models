@@ -20,109 +20,6 @@ from qai_hub_models.models.common import Precision
 from qai_hub_models.utils.base_model import BaseModel, InputSpec
 
 
-def batched_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float = 0.5) -> torch.Tensor:
-    """
-    Vectorized NMS that works with ONNX export.
-    Uses torchvision.ops.nms if available, otherwise falls back to basic filtering.
-    
-    Args:
-        boxes: Tensor of shape [N, 4] with box coordinates in format [x1, y1, x2, y2]
-        scores: Tensor of shape [N] with confidence scores for each box
-        iou_threshold: IoU threshold for suppression (default: 0.5)
-    
-    Returns:
-        keep_indices: Tensor of indices to keep after NMS
-    """
-    try:
-        # Use torchvision NMS which is ONNX-compatible
-        from torchvision.ops import nms
-        return nms(boxes, scores, iou_threshold)
-    except ImportError:
-        # Fallback: just return top-k by score (no actual NMS)
-        # This ensures ONNX export works even without torchvision
-        _, indices = torch.sort(scores, descending=True)
-        return indices
-
-
-def apply_nms_batched(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    mask_coeffs: torch.Tensor,
-    classes: torch.Tensor = None,
-    iou_threshold: float = 0.5,
-    score_threshold: float = 0.001
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Apply NMS to batched detection results using torchvision.ops.nms (ONNX-compatible).
-    
-    Args:
-        boxes: Tensor of shape [batch_size, num_anchors, 4]
-        scores: Tensor of shape [batch_size, num_anchors]
-        mask_coeffs: Tensor of shape [batch_size, num_protos, num_anchors]
-        classes: Optional tensor of shape [batch_size, num_anchors] with class indices
-        iou_threshold: IoU threshold for NMS
-        score_threshold: Minimum score threshold to keep boxes
-    
-    Returns:
-        Tuple of (filtered_boxes, filtered_scores, filtered_mask_coeffs, filtered_classes)
-        where filtered_mask_coeffs has shape [batch_size, num_protos, num_detections]
-    """
-    batch_size = boxes.shape[0]
-    num_protos = mask_coeffs.shape[1]
-    num_anchors = boxes.shape[1]
-    
-    # Process each batch
-    all_keep_indices = []
-    max_keep = 0
-    
-    for b in range(batch_size):
-        # Get boxes and scores for this batch
-        batch_boxes = boxes[b]  # [num_anchors, 4]
-        batch_scores = scores[b]  # [num_anchors]
-        
-        # Filter by score threshold
-        score_mask = batch_scores > score_threshold
-        valid_indices = torch.where(score_mask)[0]
-        
-        if valid_indices.numel() > 0:
-            valid_boxes = batch_boxes[valid_indices]
-            valid_scores = batch_scores[valid_indices]
-            
-            # Apply NMS using torchvision (ONNX-compatible)
-            keep_indices_local = batched_nms(valid_boxes, valid_scores, iou_threshold)
-            keep_indices = valid_indices[keep_indices_local]
-        else:
-            keep_indices = torch.empty((0,), dtype=torch.long, device=boxes.device)
-        
-        all_keep_indices.append(keep_indices)
-        max_keep = max(max_keep, keep_indices.numel())
-    
-    # Ensure at least 1 detection for consistent output shape
-    if max_keep == 0:
-        max_keep = 1
-    
-    # Create output tensors
-    out_boxes = torch.zeros((batch_size, max_keep, 4), device=boxes.device, dtype=boxes.dtype)
-    out_scores = torch.zeros((batch_size, max_keep), device=scores.device, dtype=scores.dtype)
-    out_mask_coeffs = torch.zeros((batch_size, num_protos, max_keep), device=mask_coeffs.device, dtype=mask_coeffs.dtype)
-    out_classes = None
-    if classes is not None:
-        out_classes = torch.zeros((batch_size, max_keep), device=classes.device, dtype=classes.dtype)
-    
-    # Fill output tensors
-    for b in range(batch_size):
-        keep_idx = all_keep_indices[b]
-        n = keep_idx.numel()
-        if n > 0:
-            out_boxes[b, :n] = boxes[b, keep_idx]
-            out_scores[b, :n] = scores[b, keep_idx]
-            out_mask_coeffs[b, :, :n] = mask_coeffs[b, :, keep_idx]
-            if classes is not None:
-                out_classes[b, :n] = classes[b, keep_idx]
-    
-    return out_boxes, out_scores, out_mask_coeffs, out_classes
-
-
 class PseudoCV2:
     """Pseudo implementation of OpenCV functionality used in this module."""
     
@@ -366,6 +263,7 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         
         return labels
 
+
     @staticmethod
     def get_input_spec(
         batch_size: int = 1,
@@ -395,6 +293,7 @@ class UltralyticsMulticlassSegmentor(BaseModel):
     def forward(self, image: torch.Tensor):
         """
         Run the segmentor on `image` and produce segmentation masks.
+        Returns ONLY the highest score prediction.
 
         Parameters
         ----------
@@ -404,23 +303,23 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         Returns:
             Tuple of 6 tensors:
                 boxes:
-                    Shape [1, num_anchors, 4]
+                    Shape [1, 1, 4]
                     where 4 = [x1, y1, x2, y2] (box coordinates in pixel space)
                 scores:
-                    Shape [batch_size, num_anchors, num_classes + 1]
+                    Shape [batch_size, 1]
                     per-anchor confidence of whether the anchor box
                     contains an object / box or does not contain an object
                 mask_coeffs:
-                    Shape [batch_size, num_anchors, num_prototype_masks]
+                    Shape [batch_size, 1, num_prototype_masks]
                     Per-anchor mask coefficients
                 class_idx:
-                    Shape [batch_size, num_anchors]
+                    Shape [batch_size, 1]
                     Index
                 mask_protos:
                     Shape [batch_size, num_prototype_masks, mask_x_size, mask_y_size]
                     Mask protos.
                 labels:
-                    Shape [batch_size, num_anchors]
+                    Shape [batch_size, 1]
                     Label indices for each anchor (currently filled with 0 as placeholder for "Test")
         """
         boxes: torch.Tensor
@@ -442,9 +341,31 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         if self.precision is None:
             classes = classes.to(torch.uint8)
 
-        # Apply threshold-based classification for labels output only
+        # ONLY keep the highest score prediction
+        batch_size = scores.shape[0]
+        
+        # Find the index of the highest score for each batch
+        max_score_idx = torch.argmax(scores, dim=1, keepdim=True)  # Shape: [batch_size, 1]
+        
+        # Gather the highest score prediction for each output
+        # boxes: [batch_size, num_anchors, 4] -> [batch_size, 1, 4]
+        boxes = torch.gather(boxes, 1, max_score_idx.unsqueeze(-1).expand(-1, -1, 4))
+        
+        # scores: [batch_size, num_anchors] -> [batch_size, 1]
+        scores_filtered = torch.gather(scores, 1, max_score_idx)
+        
+        # mask_coeffs: [batch_size, num_anchors, num_protos] -> [batch_size, 1, num_protos]
+        mask_coeffs_permuted = mask_coeffs.permute(0, 2, 1)
+        num_protos = mask_coeffs_permuted.shape[2]
+        mask_coeffs_filtered = torch.gather(mask_coeffs_permuted, 1, max_score_idx.unsqueeze(-1).expand(-1, -1, num_protos))
+        
+        # classes: [batch_size, num_anchors] -> [batch_size, 1]
+        classes = torch.gather(classes, 1, max_score_idx)
+        
+        # Apply threshold-based classification for labels output only on the best prediction
         # Score > 50% -> Bauxite (0), Score <= 50% -> Laterite (1)
-        labels = self._analyze_color_distribution(image, boxes, mask_coeffs.permute(0, 2, 1), mask_protos, scores)
-
-        return boxes, scores, mask_coeffs.permute(0, 2, 1), classes, mask_protos, labels
+        labels = self._analyze_color_distribution(image, boxes, mask_coeffs_filtered, mask_protos, scores_filtered)
+        
+        # mask_protos remains unchanged as it's shared across all predictions
+        return boxes, scores_filtered, mask_coeffs_filtered, classes, mask_protos, labels
 
