@@ -6,8 +6,12 @@ from __future__ import annotations
 
 from typing import cast
 import torch
+import torch.nn as nn
 from ultralytics.nn.modules.head import Segment
 from ultralytics.nn.tasks import SegmentationModel
+import torchvision.transforms as transforms
+import torch.nn.functional as F
+from torchvision.models import resnet50, ResNet50_Weights, mobilenet_v3_small, MobileNet_V3_Small_Weights
 
 from qai_hub_models.models._shared.ultralytics.segment_patches import (
     patch_ultralytics_segmentation_head,
@@ -239,6 +243,158 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         self.num_classes: int = cast(Segment, model.model[-1]).nc
         self.precision = precision
         patch_ultralytics_segmentation_head(model)
+        
+        # Initialize bauxite/laterite classification model (hardcoded)
+        self.classifier_model = None
+        self.use_mobilenet = False  # Set to True for MobileNet, False for ResNet
+        
+        if self.use_mobilenet:
+            self.classifier_model_path = '/home/gautam/diy_hanoon/Research/hindalco-samari/test/classification/best_bauxite_laterite_mobilenet.pth'
+        else:
+            self.classifier_model_path = '/home/gautam/diy_hanoon/Research/hindalco-samari/test/classification/best_bauxite_laterite_resnet50.pth'
+        
+        # Hardcode normalization values for ONNX compatibility
+        self.classifier_img_size = 224  # Standard size for both models
+        self.classifier_crop_size = 640  # Size of centered crop
+        self.classifier_norm_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        self.classifier_norm_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self._load_classifier_model()
+
+    def _load_classifier_model(self):
+        """Load the bauxite/laterite classification model."""
+        try:
+            device = next(self.model.parameters()).device
+            
+            if self.use_mobilenet:
+                # Load MobileNetV3-Small
+                self.classifier_model = mobilenet_v3_small(weights=MobileNet_V3_Small_Weights.IMAGENET1K_V1)
+                # Replace final classifier layer for binary classification
+                num_ftrs = self.classifier_model.classifier[3].in_features
+                self.classifier_model.classifier[3] = nn.Linear(num_ftrs, 2)  # 0 = bauxite, 1 = laterite
+            else:
+                # Load ResNet-50
+                self.classifier_model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+                # Replace final FC layer for binary classification
+                num_ftrs = self.classifier_model.fc.in_features
+                self.classifier_model.fc = nn.Sequential(
+                    nn.Dropout(p=0.3),
+                    nn.Linear(num_ftrs, 2)  # 0 = bauxite, 1 = laterite
+                )
+            
+            self.classifier_model.load_state_dict(torch.load(self.classifier_model_path, map_location=device))
+            self.classifier_model.to(device).eval()
+            print(f"✓ Loaded {'MobileNetV3-Small' if self.use_mobilenet else 'ResNet-50'} classifier from {self.classifier_model_path}")
+        except Exception as e:
+            print(f"Warning: Could not load classification model: {e}")
+            self.classifier_model = None
+
+    def _create_masked_crop(self, image: torch.Tensor, boxes: torch.Tensor, mask_coeffs: torch.Tensor, mask_protos: torch.Tensor) -> torch.Tensor:
+        """
+        Create masked crops similar to training data: 640x640 centered crop with black background.
+        
+        Args:
+            image: Tensor of shape [batch_size, 3, H, W] with values in range [0, 1]
+            boxes: Tensor of shape [batch_size, 1, 4] with box coordinates [x1, y1, x2, y2]
+            mask_coeffs: Tensor of shape [batch_size, 1, num_protos]
+            mask_protos: Tensor of shape [batch_size, num_protos, mask_h, mask_w]
+        
+        Returns:
+            crops: Tensor of shape [batch_size, 3, 640, 640] with masked and centered crops
+        """
+        batch_size = image.shape[0]
+        device = image.device
+        _, _, img_h, img_w = image.shape
+        
+        # Generate mask from coefficients and prototypes
+        # mask_coeffs: [batch_size, 1, num_protos], mask_protos: [batch_size, num_protos, mask_h, mask_w]
+        masks = torch.einsum('bnp,bphw->bnhw', mask_coeffs, mask_protos)  # [batch_size, 1, mask_h, mask_w]
+        masks = torch.sigmoid(masks)  # Apply sigmoid to get [0, 1] range
+        
+        # Resize masks to image size
+        masks_resized = F.interpolate(masks, size=(img_h, img_w), mode='bilinear', align_corners=False)
+        masks_resized = (masks_resized > 0.5).float()  # Binarize
+        
+        # Create black canvas for crops
+        crops = torch.zeros((batch_size, 3, self.classifier_crop_size, self.classifier_crop_size), 
+                           device=device, dtype=image.dtype)
+        
+        for b in range(batch_size):
+            # Get bounding box
+            x1, y1, x2, y2 = boxes[b, 0]
+            x1, y1, x2, y2 = int(x1.item()), int(y1.item()), int(x2.item()), int(y2.item())
+            
+            # Clamp to image bounds
+            x1 = max(0, min(x1, img_w - 1))
+            y1 = max(0, min(y1, img_h - 1))
+            x2 = max(0, min(x2, img_w))
+            y2 = max(0, min(y2, img_h))
+            
+            if x2 <= x1 or y2 <= y1:
+                continue  # Skip invalid boxes
+            
+            # Extract ROI and apply mask
+            roi = image[b:b+1, :, y1:y2, x1:x2]
+            roi_mask = masks_resized[b:b+1, 0:1, y1:y2, x1:x2]
+            masked_roi = roi * roi_mask
+            
+            # Get ROI dimensions
+            roi_h, roi_w = y2 - y1, x2 - x1
+            
+            # Resize if larger than crop size while maintaining aspect ratio
+            if roi_h > self.classifier_crop_size or roi_w > self.classifier_crop_size:
+                scale = min(self.classifier_crop_size / roi_h, self.classifier_crop_size / roi_w)
+                new_h = int(roi_h * scale)
+                new_w = int(roi_w * scale)
+                masked_roi = F.interpolate(masked_roi, size=(new_h, new_w), mode='bilinear', align_corners=False)
+                roi_h, roi_w = new_h, new_w
+            
+            # Center the ROI on the black canvas
+            start_y = (self.classifier_crop_size - roi_h) // 2
+            start_x = (self.classifier_crop_size - roi_w) // 2
+            crops[b, :, start_y:start_y+roi_h, start_x:start_x+roi_w] = masked_roi.squeeze(0)
+        
+        return crops
+    
+    def _classify_material(self, image: torch.Tensor, boxes: torch.Tensor, mask_coeffs: torch.Tensor, mask_protos: torch.Tensor) -> torch.Tensor:
+        """
+        Classify segmented regions as bauxite (0) or laterite (1).
+        
+        Args:
+            image: Tensor of shape [batch_size, 3, H, W] with values in range [0, 1]
+            boxes: Tensor of shape [batch_size, 1, 4] with box coordinates
+            mask_coeffs: Tensor of shape [batch_size, 1, num_protos]
+            mask_protos: Tensor of shape [batch_size, num_protos, mask_h, mask_w]
+        
+        Returns:
+            labels: Tensor of shape [batch_size, 1] with values 0 (Bauxite) or 1 (Laterite)
+        """
+        if self.classifier_model is None:
+            # If classifier model not loaded, return 0 (bauxite)
+            batch_size = image.shape[0]
+            return torch.zeros((batch_size, 1), dtype=torch.int32, device=image.device)
+        
+        batch_size = image.shape[0]
+        device = image.device
+        
+        # Create masked crops (640x640 with black background)
+        crops = self._create_masked_crop(image, boxes, mask_coeffs, mask_protos)
+        
+        # Resize to classifier input size (224x224)
+        resized = F.interpolate(crops, size=(self.classifier_img_size, self.classifier_img_size), 
+                               mode='bilinear', align_corners=False)
+        
+        # Normalize using ImageNet stats
+        mean = self.classifier_norm_mean.to(device)
+        std = self.classifier_norm_std.to(device)
+        normalized = (resized - mean) / std
+        
+        # Run classification
+        pred = self.classifier_model(normalized).argmax(1)  # Shape: [batch_size]
+        
+        # pred == 0 means bauxite, pred == 1 means laterite
+        labels = pred.unsqueeze(1).to(torch.int32)  # Shape: [batch_size, 1]
+        
+        return labels
 
     def _analyze_color_distribution(self, image: torch.Tensor, boxes: torch.Tensor, mask_coeffs: torch.Tensor, mask_protos: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         """
@@ -362,9 +518,8 @@ class UltralyticsMulticlassSegmentor(BaseModel):
         # classes: [batch_size, num_anchors] -> [batch_size, 1]
         classes = torch.gather(classes, 1, max_score_idx)
         
-        # Apply threshold-based classification for labels output only on the best prediction
-        # Score > 50% -> Bauxite (0), Score <= 50% -> Laterite (1)
-        labels = self._analyze_color_distribution(image, boxes, mask_coeffs_filtered, mask_protos, scores_filtered)
+        # Apply material classification: returns 0 for bauxite, 1 for laterite
+        labels = self._classify_material(image, boxes, mask_coeffs_filtered, mask_protos)
         
         # mask_protos remains unchanged as it's shared across all predictions
         return boxes, scores_filtered, mask_coeffs_filtered, classes, mask_protos, labels
